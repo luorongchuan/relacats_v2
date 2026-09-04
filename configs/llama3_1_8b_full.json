@@ -1,6 +1,6 @@
 {
   "model_name": "/home/luorongchuan/workspace_135/models/Llama-3.1-8B-Instruct",
-  "dataset_root": "relacats_v2/outputs/full_relacats_dataset",
+  "dataset_root": "relacats_v2/outputs/full_relacats_dataset/llama3_1_8b_instruct",
   "target_mode": "residual",
   "lambda_rel": 0.5,
   "lambda_f": 1.0,
@@ -13,7 +13,7 @@
   "dtype": "bfloat16",
   "gradient_checkpointing": true,
   "total_train_samples": 100000,
-  "total_eval_samples": 5000,
+  "total_eval_samples": 1000,
   "batch_size": 1,
   "gradient_accumulation_steps": 64,
   "num_epochs": 1,
@@ -32,13 +32,13 @@
   "datasets": [
     {"name": "arc_easy", "weight": 1.0},
     {"name": "commonsense_qa", "weight": 1.0},
-    {"name": "gsm8k", "weight": 1.0},
+    {"name": "gsm8k", "weight": 3.0},
     {"name": "logiqa", "weight": 1.0},
     {"name": "openbookqa", "weight": 1.0},
     {"name": "reclor", "weight": 1.0},
     {"name": "sciq", "weight": 1.0},
-    {"name": "svamp", "weight": 1.0},
+    {"name": "svamp", "weight": 3.0},
     {"name": "winogrande", "weight": 1.0}
   ],
-  "output_dir": "relacats_v2/outputs/checkpoints/llama3_1_8b_full_relacats"
+  "output_dir": "relacats_v2/outputs/checkpoints/llama3_1_8b_full_relacats_safe"
 }
