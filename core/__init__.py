@@ -54,11 +54,10 @@ from .full_relacats import (
     attach_full_targets,
     compute_fragility,
     compute_relssc_full,
-    controller_state,
-    effective_vote_state,
     fragility_suffix,
     strategy_similarity,
 )
+from .runtime_controller import controller_state, effective_vote_state
 
 __all__ = [
     "AnswerNormalizationResult",
