@@ -1,6 +1,6 @@
 {
   "model_name": "/home/luorongchuan/workspace_135/models/DeepSeek-R1-Distill-Qwen-1.5B",
-  "dataset_root": "relacats_v2/outputs/full_relacats_dataset",
+  "dataset_root": "relacats_v2/outputs/full_relacats_dataset/deepseek_r1_distill_qwen_1_5b",
   "target_mode": "residual",
   "lambda_rel": 0.5,
   "lambda_f": 1.0,
@@ -12,17 +12,17 @@
   "seed": 42,
   "dtype": "bfloat16",
   "gradient_checkpointing": true,
-  "total_train_samples": 200000,
+  "total_train_samples": 100000,
   "total_eval_samples": 1000,
   "batch_size": 1,
   "gradient_accumulation_steps": 64,
-  "num_epochs": 2,
+  "num_epochs": 1,
   "learning_rate": 5e-5,
   "lora_r": 32,
   "lora_alpha": 16,
   "lora_dropout": 0.05,
   "lora_target_modules": ["q_proj", "v_proj"],
-  "causal_lm_ratio": 0.8,
+  "causal_lm_ratio": 0.7,
   "threshold": 0.75,
   "smooth_l1_beta": 0.25,
   "causal_loss_scale": 0.1,
@@ -32,13 +32,13 @@
   "datasets": [
     {"name": "arc_easy", "weight": 1.0},
     {"name": "commonsense_qa", "weight": 1.0},
-    {"name": "gsm8k", "weight": 1.0},
+    {"name": "gsm8k", "weight": 3.0},
     {"name": "logiqa", "weight": 1.0},
     {"name": "openbookqa", "weight": 1.0},
     {"name": "reclor", "weight": 1.0},
     {"name": "sciq", "weight": 1.0},
-    {"name": "svamp", "weight": 1.0},
+    {"name": "svamp", "weight": 3.0},
     {"name": "winogrande", "weight": 1.0}
   ],
-  "output_dir": "relacats_v2/outputs/checkpoints/deepseek_1_5b_full_relacats"
+  "output_dir": "relacats_v2/outputs/checkpoints/deepseek_1_5b_full_relacats_safe"
 }
