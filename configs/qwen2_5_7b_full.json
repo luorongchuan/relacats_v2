@@ -1,6 +1,6 @@
 {
   "model_name": "/home/luorongchuan/workspace_135/models/Qwen2.5-7B-Instruct",
-  "dataset_root": "relacats_v2/outputs/full_relacats_dataset",
+  "dataset_root": "relacats_v2/outputs/full_relacats_dataset/qwen2_5_7b_instruct",
   "target_mode": "residual",
   "lambda_rel": 0.5,
   "lambda_f": 1.0,
@@ -12,7 +12,7 @@
   "seed": 42,
   "dtype": "bfloat16",
   "gradient_checkpointing": true,
-  "total_train_samples": 200000,
+  "total_train_samples": 100000,
   "total_eval_samples": 1000,
   "batch_size": 1,
   "gradient_accumulation_steps": 64,
@@ -22,7 +22,7 @@
   "lora_alpha": 16,
   "lora_dropout": 0.05,
   "lora_target_modules": ["q_proj", "v_proj"],
-  "causal_lm_ratio": 0.8,
+  "causal_lm_ratio": 0.7,
   "threshold": 0.75,
   "smooth_l1_beta": 0.25,
   "causal_loss_scale": 0.1,
@@ -32,13 +32,13 @@
   "datasets": [
     {"name": "arc_easy", "weight": 1.0},
     {"name": "commonsense_qa", "weight": 1.0},
-    {"name": "gsm8k", "weight": 1.0},
+    {"name": "gsm8k", "weight": 3.0},
     {"name": "logiqa", "weight": 1.0},
     {"name": "openbookqa", "weight": 1.0},
     {"name": "reclor", "weight": 1.0},
     {"name": "sciq", "weight": 1.0},
-    {"name": "svamp", "weight": 1.0},
+    {"name": "svamp", "weight": 3.0},
     {"name": "winogrande", "weight": 1.0}
   ],
-  "output_dir": "relacats_v2/outputs/checkpoints/qwen2_5_7b_full_relacats"
+  "output_dir": "relacats_v2/outputs/checkpoints/qwen2_5_7b_full_relacats_safe"
 }
