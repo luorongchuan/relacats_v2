@@ -17,7 +17,7 @@ import re
 from typing import Any, Literal
 
 
-STRICT_EXPLICIT_ANSWER_PARSER_VERSION = "explicit-final-answer-v2"
+STRICT_EXPLICIT_ANSWER_PARSER_VERSION = "explicit-final-answer-v3"
 
 # Backward-compatible exports for callers that record these names in artifact
 # metadata. All response datasets now use one parser and therefore one
@@ -57,7 +57,7 @@ _DIRECT_OPTION_INDEX_RE = re.compile(r"^\(?\s*([1-5])\s*\)?(?=$|[\s.,;:!?])")
 _NUMERIC_RE = re.compile(
     r"^[ \t]*(?P<number>[-+]?(?:[$£€][ \t]*)?(?:"
     r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+"
-    r")(?:[eE][-+]?\d+)?)"
+    r")(?:[eE][-+]?\d+)?)(?![\d,])"
 )
 
 _SMALL_NUMBERS = {
