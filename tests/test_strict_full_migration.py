@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import unittest
 
+import torch
+
 from relacats_v2.data_creation.build_full_relacats_strict import (
     _flatten_full,
     _strict_reparse_payload,
 )
 from relacats_v2.evaluation.answer_parsing import extract_explicit_answer
-from relacats_v2.model_training.train_full_relacats_masked import fragility_suffix
+from relacats_v2.model_training.train_full_relacats_masked import (
+    _binary_cross_entropy_probability,
+    fragility_suffix,
+)
 
 
 class StrictFullMigrationTests(unittest.TestCase):
@@ -106,6 +111,16 @@ class StrictFullMigrationTests(unittest.TestCase):
         self.assertIn("<|im_start|>user", fragility_suffix("Qwen2.5-7B-Instruct"))
         self.assertIn("<|start_header_id|>user", fragility_suffix("Llama-3.1-8B-Instruct"))
         self.assertIn("<｜User｜>", fragility_suffix("DeepSeek-R1-Distill-Qwen-1.5B"))
+
+    def test_probability_bce_is_autocast_safe_and_differentiable(self):
+        prediction = torch.tensor([0.8, 0.2], dtype=torch.float32, requires_grad=True)
+        target = torch.tensor([1.0, 0.0], dtype=torch.float32)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            loss = _binary_cross_entropy_probability(prediction, target)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(prediction.grad)
+        self.assertTrue(torch.all(torch.isfinite(prediction.grad)))
 
 
 if __name__ == "__main__":
