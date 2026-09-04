@@ -80,6 +80,29 @@ def _probability(value: Any, name: str) -> float:
     return result
 
 
+def _binary_cross_entropy_probability(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """BCE on probabilities in explicit float32, safe inside CUDA autocast.
+
+    ``torch.nn.functional.binary_cross_entropy`` on a sigmoid/softmax
+    probability tensor is intentionally rejected by CUDA autocast.  RelaCaTS
+    defines f_hat as a probability rather than as an independent binary logit,
+    so we keep that probability-space objective and evaluate the equivalent
+    Bernoulli negative log likelihood explicitly in float32.
+    """
+
+    probability = prediction.float().clamp(eps, 1.0 - eps)
+    truth = target.float()
+    return -(
+        truth * torch.log(probability)
+        + (1.0 - truth) * torch.log1p(-probability)
+    ).mean()
+
+
 def prepare_full_examples(
     config: dict[str, Any], split: str, requested_total: int, seed: int
 ) -> list[dict[str, Any]]:
@@ -288,9 +311,7 @@ def full_task_loss(
     encoded_f, f_targets = encoder.query(fragility_inputs, fragility=True)
     out_f = model(**encoded_f)
     f_pred = base._yes_probability(out_f, encoded_f, encoder.yes_token_id)
-    fragility_loss = F.binary_cross_entropy(
-        f_pred.clamp(1e-6, 1.0 - 1e-6), f_targets
-    )
+    fragility_loss = _binary_cross_entropy_probability(f_pred, f_targets)
     if not fragility_records:
         fragility_loss = fragility_loss * 0.0
 
