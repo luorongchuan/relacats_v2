@@ -1,0 +1,32 @@
+{
+  "model_name": "/home/luorongchuan/workspace_135/models/Qwen2.5-7B-Instruct",
+  "dataset_root": "relacats_v2/outputs/smoke/relssc_dataset",
+  "target_mode": "residual",
+  "lambda_rel": 0.5,
+  "distributed": true,
+  "seed": 42,
+  "dtype": "bfloat16",
+  "gradient_checkpointing": true,
+  "normalize_task_loss_by_records": true,
+  "total_train_samples": 16,
+  "total_eval_samples": 8,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 1,
+  "num_epochs": 1,
+  "learning_rate": 5e-5,
+  "lora_r": 32,
+  "lora_alpha": 16,
+  "lora_dropout": 0.05,
+  "lora_target_modules": ["q_proj", "v_proj"],
+  "causal_lm_ratio": 0.5,
+  "threshold": 0.75,
+  "smooth_l1_beta": 0.25,
+  "causal_loss_scale": 0.1,
+  "max_length": 1024,
+  "max_grad_norm": 1.0,
+  "max_eval_batches": 2,
+  "datasets": [
+    {"name": "arc_easy", "weight": 1.0}
+  ],
+  "output_dir": "relacats_v2/outputs/smoke/checkpoint"
+}
