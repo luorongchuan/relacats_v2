@@ -2,7 +2,8 @@
 
 These tests deliberately do not invoke vLLM or touch a GPU.  They guard the
 small amount of wiring that is easy to regress when the evaluator gains a new
-method: the default merged-checkpoint tag and the canonical report labels.
+method or evaluation protocol: the default merged-checkpoint tag, canonical
+report labels, and the CaTS paper-style budget-only path.
 """
 
 from __future__ import annotations
@@ -70,6 +71,16 @@ def test_evaluation_launcher_advertises_every_canonical_method() -> None:
         assert f'{option}="${{{option}:-' in text
 
 
+def test_evaluation_launcher_exposes_paper_budget_protocol() -> None:
+    text = _read("08_evaluate.sh")
+    assert '"${PHASE}" == "paper"' in text
+    assert "relacats_v2.evaluation.paper_budget" in text
+    assert "accuracy is excluded from parameter selection" in text
+    # The strict validation/test path still goes through aggregate.py and a
+    # threshold artifact; paper mode must not be forced to fabricate one.
+    assert '--threshold-file "${THRESHOLD_ROOT}/${dataset}.json"' in text
+
+
 def test_confidence_launcher_describes_shared_artifact_consumers() -> None:
     """06/07 produce one pool consumed by all baseline and RelaCaTS rows."""
 
@@ -105,6 +116,15 @@ def test_serial_runner_uses_one_tp_worker_per_model() -> None:
     # returned; this is the key serialisation contract.
     assert '===== COMPLETE ${tag}:' in text
     assert 'ALL SERIAL RELACATS-V2 ${EVAL_PHASE^^} RUNS COMPLETE' in text
+
+
+def test_serial_runner_separates_test_split_from_paper_aggregation() -> None:
+    text = _read("12_evaluate_serial_tp2_gpu67.sh")
+    assert 'EVAL_SPLIT="${EVAL_SPLIT:-${EVAL_PHASE}}"' in text
+    assert 'AGGREGATION_PHASE="${AGGREGATION_PHASE:-${EVAL_PHASE}}"' in text
+    assert 'PHASE="${AGGREGATION_PHASE}"' in text
+    assert 'AGGREGATION_PHASE=paper requires EVAL_SPLIT=test' in text
+    assert 'aggregation_phase=${AGGREGATION_PHASE}' in text
 
 
 def test_old_model_retest_is_serial_tp2_and_never_trains_or_merges() -> None:
