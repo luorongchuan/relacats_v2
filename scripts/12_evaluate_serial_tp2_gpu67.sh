@@ -56,8 +56,14 @@ EXPECTED_QUESTIONS="${EXPECTED_QUESTIONS:-}"
 BASE_OUTPUT_ROOT="${BASE_OUTPUT_ROOT:-${ROOT_DIR}/relacats_v2/outputs/eval_serial_tp2_v2}"
 BASE_LOG_ROOT="${BASE_LOG_ROOT:-${ROOT_DIR}/relacats_v2/outputs/logs/eval_serial_tp2_v2}"
 CACHE_ROOT="${CACHE_ROOT:-/home/luorongchuan/workspace_135/datasets/.hf_cache_selfcal_eval}"
+
+# EVAL_PHASE/EVAL_SPLIT describe the physical data being generated/read.
+# AGGREGATION_PHASE describes only the CPU evaluation protocol.  Keeping these
+# separate lets the original-CaTS paper protocol operate on split='test'
+# records without pretending that Object Counting has a validation split.
 EVAL_PHASE="${EVAL_PHASE:-test}"
 EVAL_SPLIT="${EVAL_SPLIT:-${EVAL_PHASE}}"
+AGGREGATION_PHASE="${AGGREGATION_PHASE:-${EVAL_PHASE}}"
 
 # Defaults are the three released author checkpoints.  For later experiments
 # override MODEL_SPECS and use a new BASE_OUTPUT_ROOT for each protocol/model
@@ -77,6 +83,11 @@ fail() {
 [[ "${NUM_SHARDS}" == "1" ]] || fail "NUM_SHARDS must be 1 for tensor-parallel mode"
 [[ "${EVAL_GPU_MODE}" == "tensor_parallel" ]] || fail "EVAL_GPU_MODE must be tensor_parallel in this runner"
 [[ "${EVAL_PHASE}" == "validation" || "${EVAL_PHASE}" == "test" ]] || fail "EVAL_PHASE must be validation or test"
+[[ "${AGGREGATION_PHASE}" == "validation" || "${AGGREGATION_PHASE}" == "test" || "${AGGREGATION_PHASE}" == "paper" ]] || \
+  fail "AGGREGATION_PHASE must be validation, test, or paper"
+if [[ "${AGGREGATION_PHASE}" == "paper" && "${EVAL_SPLIT}" != "test" ]]; then
+  fail "AGGREGATION_PHASE=paper requires EVAL_SPLIT=test"
+fi
 [[ "${NUM_GENERATIONS}" =~ ^[1-9][0-9]*$ ]] || fail "NUM_GENERATIONS must be a positive integer"
 (( NUM_GENERATIONS >= 16 )) || fail "NUM_GENERATIONS must be at least 16 for Table 2"
 
@@ -129,8 +140,9 @@ check_gpu_idle "${GPU_SECOND}"
 
 echo "RelaCaTS-v2 serial evaluation starting"
 echo "  mode=${EVAL_GPU_MODE}; tensor_parallel_size=${TENSOR_PARALLEL_SIZE}; visible_gpus=${GPU_FIRST},${GPU_SECOND}"
-echo "  datasets=${DATASET_LIST}"
+echo "  datasets=${DATASET_LIST}; split=${EVAL_SPLIT}"
 echo "  candidate_pool=${NUM_GENERATIONS}; target_average_budget=${BUDGET_TARGETS}"
+echo "  aggregation_phase=${AGGREGATION_PHASE}"
 echo "  output_root=${BASE_OUTPUT_ROOT}"
 echo "  methods=SC/CISC/Self-Certainty/Best-of-N/ASC/ESC/RASC + RelaCaTS-SC/ES/ASC"
 
@@ -224,13 +236,14 @@ for spec in "${MODEL_SPEC_ARRAY[@]}"; do
     bash "${ROOT_DIR}/relacats_v2/scripts/07_calculate_confidence.sh"
   wait_gpu_idle
 
-  # Stage 3 is CPU-only and writes all currently registered methods, including
-  # CISC, Self-Certainty, ESC, and RASC plus the three RelaCaTS rows.
+  # Stage 3 is CPU-only.  PHASE is deliberately decoupled from EVAL_SPLIT so
+  # paper mode can aggregate held-out test records using the original CaTS
+  # average-budget matching rule without requiring a validation artifact.
   env \
     PYTHON_BIN="${PYTHON_BIN}" \
     INPUT_ROOT="${confidence_root}" \
     OUTPUT_ROOT="${result_root}" \
-    PHASE="${EVAL_PHASE}" \
+    PHASE="${AGGREGATION_PHASE}" \
     MODEL_ID="${tag}" \
     THRESHOLD_ROOT="${threshold_root}" \
     DATASETS="${DATASET_LIST}" \
@@ -250,5 +263,5 @@ for spec in "${MODEL_SPEC_ARRAY[@]}"; do
 done
 
 echo
-echo "ALL SERIAL RELACATS-V2 ${EVAL_PHASE^^} RUNS COMPLETE"
+echo "ALL SERIAL RELACATS-V2 ${EVAL_PHASE^^} RUNS COMPLETE (aggregation=${AGGREGATION_PHASE})"
 echo "Results root: ${BASE_OUTPUT_ROOT}"
