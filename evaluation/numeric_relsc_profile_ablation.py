@@ -1,14 +1,22 @@
 """CPU-only pure-RelSC profile ablation for GSM8K/SVAMP.
 
-This script reuses already-generated JSONs.  It compares the matched 32I SSC
-baseline from --baseline-root against count-based RelSC profiles constructed
-from the numeric relation pool in --input-root.
+This script reuses already-generated JSONs.  It diagnoses which numeric
+relation subtypes help or hurt count-based RelSC.
 
-Important: subset profiles such as Identity+Layout use only the responses that
-already exist for those views.  They are therefore diagnostics, not equal-
-generation-budget final results.  If a profile is selected, regenerate with
-that relation profile so the full N=32 budget is redistributed over the chosen
-views before reporting a final comparison.
+Two baselines are reported for every subset profile:
+
+1. SSC-32I: the full 32-response identity-only CaTS baseline.
+2. SSC-matched: an identity-only SSC baseline using the same number of stored
+   responses as that profile uses on each question.
+
+The matched-budget comparison is the important diagnostic for relation quality:
+it separates "this relation is harmful" from "this subset merely used fewer
+samples than the 32I baseline".
+
+Subset profiles still reuse the already-generated relation pool, so they are
+not final equal-generation-budget results.  Once a profile is selected, it
+should be regenerated with the full N=32 budget redistributed over the chosen
+views before a final paper comparison.
 """
 
 from __future__ import annotations
@@ -23,6 +31,7 @@ import numpy as np
 
 from relacats_v2.evaluation.reproduce_table1 import (
     Observation,
+    _filtered_samples,
     _index_payloads,
     _load_payloads,
     _sample_answer,
@@ -67,15 +76,25 @@ class MetricRow:
     ece_paper: float
     ece_strict: float
     brier: float
+    ssc32_accuracy: float
+    ssc32_ece_paper: float
+    ssc32_brier: float
     delta_accuracy_vs_ssc32i: float
     delta_ece_vs_ssc32i: float
     delta_brier_vs_ssc32i: float
+    ssc_matched_accuracy: float
+    ssc_matched_ece_paper: float
+    ssc_matched_brier: float
+    delta_accuracy_vs_ssc_matched: float
+    delta_ece_vs_ssc_matched: float
+    delta_brier_vs_ssc_matched: float
 
 
 @dataclass(frozen=True)
 class BootstrapRow:
     dataset: str
     profile: str
+    comparison: str
     metric: str
     n: int
     baseline_value: float
@@ -115,7 +134,9 @@ def relation_subtype(sample: Mapping[str, Any]) -> str:
     return relation_type or relation_id
 
 
-def select_samples(payload: Mapping[str, Any], subtypes: Sequence[str]) -> list[dict[str, Any]]:
+def select_samples(
+    payload: Mapping[str, Any], subtypes: Sequence[str]
+) -> list[dict[str, Any]]:
     allowed = set(subtypes)
     return [
         dict(sample)
@@ -131,7 +152,9 @@ def profile_observation(
     subtypes: Sequence[str],
 ) -> tuple[Observation | None, int, int]:
     selected = select_samples(payload, subtypes)
-    valid = sum(_sample_answer(sample, keep_invalid=False) is not None for sample in selected)
+    valid = sum(
+        _sample_answer(sample, keep_invalid=False) is not None for sample in selected
+    )
     if not selected:
         return None, 0, 0
     sliced = dict(payload)
@@ -150,7 +173,46 @@ def profile_observation(
     return obs, len(selected), valid
 
 
-def metric_value(labels: np.ndarray, scores: np.ndarray, metric: str, n_bins: int) -> float:
+def matched_ssc_observation(
+    dataset: str,
+    baseline_payload: Mapping[str, Any],
+    sample_budget: int,
+    method: str,
+) -> Observation | None:
+    """SSC on the first deterministic k identity-only samples for this question."""
+    if sample_budget <= 0:
+        return None
+    samples = _filtered_samples(baseline_payload, scope="all")
+    if not samples:
+        return None
+    k = min(sample_budget, len(samples))
+    sliced = dict(baseline_payload)
+    sliced["samples"] = samples[:k]
+    obs = _ssc_observation(
+        dataset,
+        sliced,
+        scope="all",
+        invalid_policy="paper",
+    )
+    if obs is None:
+        return None
+    return Observation(
+        method=method,
+        dataset=obs.dataset,
+        question_id=obs.question_id,
+        confidence=obs.confidence,
+        correct=obs.correct,
+        predicted_answer=obs.predicted_answer,
+        gold_answer=obs.gold_answer,
+    )
+
+
+def metric_value(
+    labels: np.ndarray,
+    scores: np.ndarray,
+    metric: str,
+    n_bins: int,
+) -> float:
     if metric == "accuracy":
         return 100.0 * float(np.mean(labels))
     if metric == "brier":
@@ -164,53 +226,80 @@ def metric_value(labels: np.ndarray, scores: np.ndarray, metric: str, n_bins: in
     raise ValueError(metric)
 
 
+def observation_metrics(
+    observations: Sequence[Observation],
+    shared_ids: Sequence[str],
+    n_bins: int,
+) -> tuple[float, float, float, float]:
+    by_id = {obs.question_id: obs for obs in observations}
+    labels = np.asarray([by_id[q].correct for q in shared_ids], dtype=float)
+    scores = np.asarray([by_id[q].confidence for q in shared_ids], dtype=float)
+    return (
+        metric_value(labels, scores, "accuracy", n_bins),
+        metric_value(labels, scores, "ece_paper", n_bins),
+        metric_value(labels, scores, "ece_strict", n_bins),
+        metric_value(labels, scores, "brier", n_bins),
+    )
+
+
 def metric_row(
     dataset: str,
     method: str,
     observations: Sequence[Observation],
     selected_counts: Sequence[int],
     valid_counts: Sequence[int],
-    baseline: Sequence[Observation],
+    baseline32: Sequence[Observation],
+    baseline_matched: Sequence[Observation],
     n_bins: int,
 ) -> MetricRow:
-    obs_by_id = {obs.question_id: obs for obs in observations}
-    base_by_id = {obs.question_id: obs for obs in baseline}
-    shared = sorted(set(obs_by_id) & set(base_by_id))
+    target_by_id = {obs.question_id: obs for obs in observations}
+    base32_by_id = {obs.question_id: obs for obs in baseline32}
+    matched_by_id = {obs.question_id: obs for obs in baseline_matched}
+    shared = sorted(set(target_by_id) & set(base32_by_id) & set(matched_by_id))
     if not shared:
         raise ValueError(f"{dataset}/{method}: no paired observations")
 
-    labels = np.asarray([obs_by_id[q].correct for q in shared], dtype=float)
-    scores = np.asarray([obs_by_id[q].confidence for q in shared], dtype=float)
-    base_labels = np.asarray([base_by_id[q].correct for q in shared], dtype=float)
-    base_scores = np.asarray([base_by_id[q].confidence for q in shared], dtype=float)
-
-    acc = metric_value(labels, scores, "accuracy", n_bins)
-    ece = metric_value(labels, scores, "ece_paper", n_bins)
-    ece_strict = metric_value(labels, scores, "ece_strict", n_bins)
-    brier = metric_value(labels, scores, "brier", n_bins)
-    bacc = metric_value(base_labels, base_scores, "accuracy", n_bins)
-    bece = metric_value(base_labels, base_scores, "ece_paper", n_bins)
-    bbrier = metric_value(base_labels, base_scores, "brier", n_bins)
+    acc, ece, ece_strict, brier = observation_metrics(observations, shared, n_bins)
+    b32_acc, b32_ece, _, b32_brier = observation_metrics(
+        baseline32, shared, n_bins
+    )
+    bm_acc, bm_ece, _, bm_brier = observation_metrics(
+        baseline_matched, shared, n_bins
+    )
 
     return MetricRow(
         dataset=dataset,
         method=method,
         n=len(shared),
-        mean_selected_samples=float(np.mean(selected_counts)) if selected_counts else float("nan"),
-        mean_valid_samples=float(np.mean(valid_counts)) if valid_counts else float("nan"),
+        mean_selected_samples=(
+            float(np.mean(selected_counts)) if selected_counts else float("nan")
+        ),
+        mean_valid_samples=(
+            float(np.mean(valid_counts)) if valid_counts else float("nan")
+        ),
         accuracy=acc,
         ece_paper=ece,
         ece_strict=ece_strict,
         brier=brier,
-        delta_accuracy_vs_ssc32i=acc - bacc,
-        delta_ece_vs_ssc32i=ece - bece,
-        delta_brier_vs_ssc32i=brier - bbrier,
+        ssc32_accuracy=b32_acc,
+        ssc32_ece_paper=b32_ece,
+        ssc32_brier=b32_brier,
+        delta_accuracy_vs_ssc32i=acc - b32_acc,
+        delta_ece_vs_ssc32i=ece - b32_ece,
+        delta_brier_vs_ssc32i=brier - b32_brier,
+        ssc_matched_accuracy=bm_acc,
+        ssc_matched_ece_paper=bm_ece,
+        ssc_matched_brier=bm_brier,
+        delta_accuracy_vs_ssc_matched=acc - bm_acc,
+        delta_ece_vs_ssc_matched=ece - bm_ece,
+        delta_brier_vs_ssc_matched=brier - bm_brier,
     )
 
 
 def bootstrap_rows(
     dataset: str,
     profile: str,
+    comparison: str,
     baseline: Sequence[Observation],
     target: Sequence[Observation],
     n_bins: int,
@@ -228,12 +317,14 @@ def bootstrap_rows(
     tl = np.asarray([tgt[q].correct for q in shared], dtype=float)
     ts = np.asarray([tgt[q].confidence for q in shared], dtype=float)
     n = len(shared)
-    rng = np.random.default_rng(seed)
     out: list[BootstrapRow] = []
 
-    for metric in ("accuracy", "ece_paper", "ece_strict", "brier"):
+    for metric_index, metric in enumerate(
+        ("accuracy", "ece_paper", "ece_strict", "brier")
+    ):
         baseline_value = metric_value(bl, bs, metric, n_bins)
         profile_value = metric_value(tl, ts, metric, n_bins)
+        rng = np.random.default_rng(seed + metric_index)
         deltas = np.empty(replicates, dtype=float)
         for i in range(replicates):
             idx = rng.integers(0, n, size=n)
@@ -243,13 +334,18 @@ def bootstrap_rows(
             )
         low, high = np.percentile(deltas, [2.5, 97.5])
         if metric == "accuracy":
-            p_improve = float(np.mean(deltas > 0) + 0.5 * np.mean(deltas == 0))
+            p_improve = float(
+                np.mean(deltas > 0) + 0.5 * np.mean(deltas == 0)
+            )
         else:
-            p_improve = float(np.mean(deltas < 0) + 0.5 * np.mean(deltas == 0))
+            p_improve = float(
+                np.mean(deltas < 0) + 0.5 * np.mean(deltas == 0)
+            )
         out.append(
             BootstrapRow(
                 dataset=dataset,
                 profile=profile,
+                comparison=comparison,
                 metric=metric,
                 n=n,
                 baseline_value=baseline_value,
@@ -288,7 +384,10 @@ def main() -> None:
 
     print("Pure RelSC numeric relation-profile ablation")
     print("==========================================")
-    print("Subset profiles are diagnostic; they do not all use 32 stored responses.\n")
+    print(
+        "Each subset is compared both with SSC-32I and with an identity-only "
+        "SSC baseline using the same per-question sample budget.\n"
+    )
 
     for dataset in args.datasets:
         baseline_index = _index_payloads(_load_payloads(baseline_root, dataset))
@@ -297,70 +396,137 @@ def main() -> None:
         if not shared:
             raise ValueError(f"{dataset}: no shared questions")
 
-        baseline_obs: list[Observation] = []
+        baseline32_obs: list[Observation] = []
         for qid in shared:
-            obs = _ssc_observation(dataset, baseline_index[qid], scope="all", invalid_policy="paper")
+            obs = _ssc_observation(
+                dataset,
+                baseline_index[qid],
+                scope="all",
+                invalid_policy="paper",
+            )
             if obs is not None:
-                baseline_obs.append(obs)
+                baseline32_obs.append(obs)
 
         print(f"[{dataset}] questions={len(shared)}")
         dataset_metrics: list[MetricRow] = []
 
         for profile, subtypes in PROFILE_SUBTYPES.items():
             observations: list[Observation] = []
+            matched_baseline_obs: list[Observation] = []
             selected_counts: list[int] = []
             valid_counts: list[int] = []
+
             for qid in shared:
                 obs, selected_n, valid_n = profile_observation(
-                    dataset, relation_index[qid], profile, subtypes
+                    dataset,
+                    relation_index[qid],
+                    profile,
+                    subtypes,
                 )
-                if obs is not None:
-                    observations.append(obs)
-                    selected_counts.append(selected_n)
-                    valid_counts.append(valid_n)
-                    detail_rows.append({
+                if obs is None:
+                    continue
+                matched = matched_ssc_observation(
+                    dataset,
+                    baseline_index[qid],
+                    selected_n,
+                    f"SSC-matched::{profile}",
+                )
+                if matched is None:
+                    continue
+
+                observations.append(obs)
+                matched_baseline_obs.append(matched)
+                selected_counts.append(selected_n)
+                valid_counts.append(valid_n)
+                detail_rows.append(
+                    {
                         "dataset": dataset,
                         "question_id": qid,
                         "profile": profile,
                         "selected_samples": selected_n,
                         "valid_samples": valid_n,
-                        "prediction": obs.predicted_answer,
-                        "confidence": obs.confidence,
-                        "correct": obs.correct,
-                    })
+                        "profile_prediction": obs.predicted_answer,
+                        "profile_confidence": obs.confidence,
+                        "profile_correct": obs.correct,
+                        "matched_ssc_prediction": matched.predicted_answer,
+                        "matched_ssc_confidence": matched.confidence,
+                        "matched_ssc_correct": matched.correct,
+                    }
+                )
 
             row = metric_row(
-                dataset, profile, observations, selected_counts, valid_counts,
-                baseline_obs, args.n_bins
+                dataset,
+                profile,
+                observations,
+                selected_counts,
+                valid_counts,
+                baseline32_obs,
+                matched_baseline_obs,
+                args.n_bins,
             )
             metric_rows.append(row)
             dataset_metrics.append(row)
+
             boot_rows.extend(
                 bootstrap_rows(
-                    dataset, profile, baseline_obs, observations, args.n_bins,
-                    args.bootstrap_replicates, args.seed
+                    dataset,
+                    profile,
+                    "SSC-32I -> profile",
+                    baseline32_obs,
+                    observations,
+                    args.n_bins,
+                    args.bootstrap_replicates,
+                    args.seed,
+                )
+            )
+            boot_rows.extend(
+                bootstrap_rows(
+                    dataset,
+                    profile,
+                    "SSC-matched -> profile",
+                    matched_baseline_obs,
+                    observations,
+                    args.n_bins,
+                    args.bootstrap_replicates,
+                    args.seed + 100,
                 )
             )
 
         ranked = sorted(
             dataset_metrics,
-            key=lambda r: (r.ece_paper, r.brier, -r.accuracy),
+            key=lambda r: (
+                r.delta_ece_vs_ssc_matched,
+                r.delta_brier_vs_ssc_matched,
+                -r.delta_accuracy_vs_ssc_matched,
+            ),
         )
-        print("  Lowest-ECE pure-RelSC profiles:")
-        for row in ranked[:6]:
+        print("  Best profiles vs same-budget identity SSC:")
+        for row in ranked[:8]:
             print(
                 f"    {row.method:<24s} n~{row.mean_selected_samples:5.1f} "
-                f"acc={row.accuracy:6.2f} ECE={row.ece_paper:6.2f} "
-                f"Brier={row.brier:6.3f} "
-                f"dAcc={row.delta_accuracy_vs_ssc32i:+6.2f} "
-                f"dECE={row.delta_ece_vs_ssc32i:+6.2f} "
-                f"dBrier={row.delta_brier_vs_ssc32i:+6.3f}"
+                f"RelSC acc={row.accuracy:6.2f} ECE={row.ece_paper:6.2f} "
+                f"Brier={row.brier:6.3f} | "
+                f"SSC-k acc={row.ssc_matched_accuracy:6.2f} "
+                f"ECE={row.ssc_matched_ece_paper:6.2f} "
+                f"Brier={row.ssc_matched_brier:6.3f} | "
+                f"dAcc={row.delta_accuracy_vs_ssc_matched:+6.2f} "
+                f"dECE={row.delta_ece_vs_ssc_matched:+6.2f} "
+                f"dBrier={row.delta_brier_vs_ssc_matched:+6.3f}"
             )
         print()
 
-    write_csv(output_dir / "numeric_relsc_profile_metrics.csv", [asdict(r) for r in metric_rows])
-    write_csv(output_dir / "numeric_relsc_profile_bootstrap.csv", [asdict(r) for r in boot_rows])
-    write_csv(output_dir / "numeric_relsc_profile_questions.csv", detail_rows)
+    write_csv(
+        output_dir / "numeric_relsc_profile_metrics.csv",
+        [asdict(r) for r in metric_rows],
+    )
+    write_csv(
+        output_dir / "numeric_relsc_profile_bootstrap.csv",
+        [asdict(r) for r in boot_rows],
+    )
+    write_csv(
+        output_dir / "numeric_relsc_profile_questions.csv",
+        detail_rows,
+    )
 
     print("Outputs:")
     print(f"  {output_dir / 'numeric_relsc_profile_metrics.csv'}")
