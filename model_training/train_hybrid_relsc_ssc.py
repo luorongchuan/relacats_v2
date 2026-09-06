@@ -8,7 +8,9 @@ Training pool semantics:
 - the same field is used for the > eta causal-LM selection unless
   ``causal_selection_field`` is explicitly configured otherwise;
 - calibration examples are balanced over 0.05-wide confidence bins, following
-  the CaTS training code.
+  the CaTS training code;
+- requested global train/eval and calibration/causal budgets are allocated
+  exactly across datasets with deterministic largest-remainder rounding.
 """
 
 from __future__ import annotations
@@ -16,11 +18,54 @@ from __future__ import annotations
 import math
 import random
 from collections import defaultdict
-from typing import Any
+from typing import Any, Sequence
 
 from relacats_v2.model_training import train_relacats as base
 
 HYBRID_MODE = "hybrid_direct"
+
+
+def _exact_weighted_allocation(
+    total: int,
+    weights: Sequence[float],
+) -> list[int]:
+    """Allocate an integer total exactly according to non-negative weights.
+
+    Independent ``round(total * weight / sum(weights))`` calls can lose or add
+    a few records globally (for example 100000 -> 99998).  Largest-remainder
+    allocation preserves the requested total exactly while remaining as close
+    as possible to the desired proportions.  Ties are resolved by dataset
+    order for deterministic reproduction.
+    """
+
+    if total < 0:
+        raise ValueError("allocation total must be non-negative")
+    if not weights:
+        if total == 0:
+            return []
+        raise ValueError("cannot allocate a positive total over no weights")
+
+    clean = [float(weight) for weight in weights]
+    if any(not math.isfinite(weight) or weight < 0 for weight in clean):
+        raise ValueError("allocation weights must be finite and non-negative")
+    weight_sum = sum(clean)
+    if weight_sum <= 0:
+        raise ValueError("allocation weights must sum to a positive value")
+
+    quotas = [total * weight / weight_sum for weight in clean]
+    allocation = [int(math.floor(quota)) for quota in quotas]
+    remainder = total - sum(allocation)
+
+    order = sorted(
+        range(len(clean)),
+        key=lambda index: (-(quotas[index] - allocation[index]), index),
+    )
+    for index in order[:remainder]:
+        allocation[index] += 1
+
+    if sum(allocation) != total:
+        raise AssertionError("exact weighted allocation failed to preserve total")
+    return allocation
 
 
 def prepare_hybrid_examples(
@@ -33,6 +78,8 @@ def prepare_hybrid_examples(
     threshold = float(config["threshold"])
     if not 0.0 <= causal_ratio <= 1.0:
         raise ValueError("causal_lm_ratio must be in [0,1]")
+    if requested_total <= 0:
+        raise ValueError("requested_total must be positive")
 
     rng = random.Random(seed + (0 if split == "train" else 10_000))
     mixed: list[dict[str, Any]] = []
@@ -44,13 +91,23 @@ def prepare_hybrid_examples(
         if not math.isfinite(weight) or weight < 0:
             raise ValueError(f"Invalid dataset weight: {spec!r}")
         raw_weights.append(weight)
-    total_weight = sum(raw_weights)
-    if total_weight <= 0:
+    if sum(raw_weights) <= 0:
         raise ValueError("Dataset weights must sum to a positive value")
 
-    for spec, raw_weight in zip(specs, raw_weights):
+    # Preserve both global budgets exactly.  This avoids independent per-dataset
+    # rounding changing 100000 into 99998 (or 1000 into 1001), and also keeps
+    # the configured causal/calibration mixture exact at the global level.
+    causal_total = int(round(requested_total * causal_ratio))
+    calibration_total = requested_total - causal_total
+    calibration_allocations = _exact_weighted_allocation(
+        calibration_total, raw_weights
+    )
+    causal_allocations = _exact_weighted_allocation(causal_total, raw_weights)
+
+    for spec, calibration_count, causal_count in zip(
+        specs, calibration_allocations, causal_allocations
+    ):
         name = spec["name"]
-        fraction = raw_weight / total_weight
         records = base.load_records(dataset_root, name, split)
 
         valid: list[dict[str, Any]] = []
@@ -79,10 +136,6 @@ def prepare_hybrid_examples(
                 f"Dataset {name!r} has no rows with usable {target_field!r} and "
                 f"{causal_field!r}. Rebuild the hybrid dataset first."
             )
-
-        dataset_total = int(round(requested_total * fraction))
-        calibration_count = int(round(dataset_total * (1.0 - causal_ratio)))
-        causal_count = max(0, dataset_total - calibration_count)
 
         bins: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for record in valid:
