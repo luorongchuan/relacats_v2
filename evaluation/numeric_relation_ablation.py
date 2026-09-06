@@ -1,10 +1,10 @@
 """CPU-only diagnosis for numeric RelaCaTS relations on GSM8K/SVAMP.
 
-This script consumes already-generated question JSONs.  It does not generate
+This script consumes already-generated question JSONs. It does not generate
 new model responses and therefore does not require a GPU.
 
 It is intended for the situation where matched 32I SSC baselines and the
-numeric-metamorphic RelaCaTS pool already exist.  The script answers three
+numeric-metamorphic RelaCaTS pool already exist. The script answers three
 questions:
 
 1. Which relation subtype helps or hurts calibration?
@@ -47,12 +47,10 @@ from relacats_v2.evaluation.reproduce_table1 import (
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RELATIONAL_ROOT = (
-    REPO_ROOT.parent
-    / "relacats_v1/outputs/generated_data/llama3_1_8b_instruct"
+    REPO_ROOT / "relacats_v1/outputs/generated_data/llama3_1_8b_instruct"
 )
 DEFAULT_BASELINE_ROOT = (
-    REPO_ROOT.parent
-    / "relacats_v1/outputs/generated_data_identity_only/llama3_1_8b_instruct"
+    REPO_ROOT / "relacats_v1/outputs/generated_data_identity_only/llama3_1_8b_instruct"
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "relacats_v2/outputs/numeric_relation_ablation"
 
@@ -63,7 +61,6 @@ RELATION_SUBTYPES = (
     "equivalent_quantity",
 )
 
-# Diagnostic profiles.  These are deliberately transparent rather than tuned.
 PROFILE_SUBTYPES: dict[str, tuple[str, ...]] = {
     "Identity-only (stored g0)": ("identity",),
     "Layout-only": ("layout_wrapper",),
