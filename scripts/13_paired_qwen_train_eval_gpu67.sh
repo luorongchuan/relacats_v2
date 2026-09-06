@@ -2,13 +2,26 @@
 set -Eeuo pipefail
 
 # One-click paired Qwen experiment:
-#   preflight -> optional smoke runs -> full SSC/RelSC training -> LoRA merge
+#   preflight -> optional short smoke -> full SSC/RelSC training -> LoRA merge
 #   -> Table-2 style evaluation on GPUs 6+7 -> paired comparison report.
 #
+# High-throughput A100-80GB profile (validated on GPUs 6/7):
+#   per-rank micro-batch = 14
+#   world size           = 2
+#   grad accumulation    = 5
+#   effective update     = 140 records
+#   gradient checkpointing disabled
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#
 # The two full training runs use exactly the same paired dataset, sampling
-# fields, seed, 100k/1k budgets and hyperparameters.  Only target_field differs:
+# fields, seed, 100k/1k budgets, high-throughput batch profile and all other
+# hyperparameters.  Only target_field differs:
 #   SSC   : ssc_consistency
 #   RelSC : relsc_consistency
+#
+# NOTE: effective batch 140 is the high-throughput paired protocol, not the
+# original batch-128 CaTS reproduction.  It is valid for the controlled
+# SSC-vs-RelSC target comparison because both runs use the identical profile.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
@@ -31,15 +44,25 @@ EVAL_ROOT="${EVAL_ROOT:-${ROOT_DIR}/relacats_v2/outputs/paired_qwen_eval}"
 COMPARE_ROOT="${COMPARE_ROOT:-${ROOT_DIR}/relacats_v2/outputs/paired_qwen_comparison}"
 
 RUN_TESTS="${RUN_TESTS:-1}"
-RUN_SMOKE="${RUN_SMOKE:-1}"
+# The separate B=14 VRAM probe already serves as the normal smoke test, so the
+# one-click high-throughput pipeline skips smoke by default.  Set RUN_SMOKE=1
+# to rerun a five-step smoke with the exact same batch profile as full training.
+RUN_SMOKE="${RUN_SMOKE:-0}"
 RUN_FULL="${RUN_FULL:-1}"
 RUN_MERGE="${RUN_MERGE:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
 
-SMOKE_TRAIN_SAMPLES="${SMOKE_TRAIN_SAMPLES:-4000}"
-SMOKE_EVAL_SAMPLES="${SMOKE_EVAL_SAMPLES:-200}"
-SMOKE_STEPS="${SMOKE_STEPS:-20}"
+# High-throughput training knobs.  Keep these identical for SSC and RelSC.
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-14}"
+TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-5}"
+TRAIN_GRADIENT_CHECKPOINTING="${TRAIN_GRADIENT_CHECKPOINTING:-0}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_CUDA_ALLOC_CONF
+
+SMOKE_TRAIN_SAMPLES="${SMOKE_TRAIN_SAMPLES:-8192}"
+SMOKE_EVAL_SAMPLES="${SMOKE_EVAL_SAMPLES:-64}"
+SMOKE_STEPS="${SMOKE_STEPS:-5}"
 
 DATASETS="${DATASETS:-object_counting math_qa arc_challenge}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-32}"
@@ -49,6 +72,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 QUESTION_BATCH_SIZE="${QUESTION_BATCH_SIZE:-8}"
 CONFIDENCE_BATCH_SIZE="${CONFIDENCE_BATCH_SIZE:-128}"
 SEED="${SEED:-42}"
+ALLOW_BUSY_GPUS="${ALLOW_BUSY_GPUS:-0}"
 
 mkdir -p "${LOG_ROOT}" "${EVAL_ROOT}" "${COMPARE_ROOT}"
 
@@ -57,8 +81,30 @@ fail() { echo "ERROR: $*" >&2; exit 1; }
 [[ -f "${SSC_CONFIG}" ]] || fail "Missing SSC config: ${SSC_CONFIG}"
 [[ -f "${RELSC_CONFIG}" ]] || fail "Missing RelSC config: ${RELSC_CONFIG}"
 [[ -f "${BASE_MODEL}/config.json" ]] || fail "Base model not found: ${BASE_MODEL}"
+[[ "${TRAIN_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail "TRAIN_BATCH_SIZE must be a positive integer"
+[[ "${TRAIN_GRAD_ACCUM_STEPS}" =~ ^[1-9][0-9]*$ ]] || fail "TRAIN_GRAD_ACCUM_STEPS must be a positive integer"
+[[ "${TRAIN_GRADIENT_CHECKPOINTING}" == "0" || "${TRAIN_GRADIENT_CHECKPOINTING}" == "1" ]] || \
+  fail "TRAIN_GRADIENT_CHECKPOINTING must be 0 or 1"
+[[ "${GPU_FIRST}" != "${GPU_SECOND}" ]] || fail "GPU_FIRST and GPU_SECOND must differ"
 
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
+
+EFFECTIVE_UPDATE_BATCH=$(( TRAIN_BATCH_SIZE * 2 * TRAIN_GRAD_ACCUM_STEPS ))
+# With 100k records, DDP gives 50k records/rank. DataLoader(drop_last=True)
+# followed by integer gradient accumulation yields this exact one-epoch count.
+MICROBATCHES_PER_RANK=$(( 50000 / TRAIN_BATCH_SIZE ))
+EXPECTED_FULL_UPDATES=$(( MICROBATCHES_PER_RANK / TRAIN_GRAD_ACCUM_STEPS ))
+
+check_gpu_idle() {
+  if [[ "${ALLOW_BUSY_GPUS}" == "1" ]]; then
+    return 0
+  fi
+  local gpu="$1"
+  local pids
+  pids="$(nvidia-smi -i "${gpu}" --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d')" \
+    || fail "Unable to query GPU ${gpu}"
+  [[ -z "${pids}" ]] || fail "GPU ${gpu} is busy (PID(s): ${pids}); finish/stop the VRAM probe before starting the one-click run"
+}
 
 check_pairing() {
   "${PYTHON_BIN}" - <<'PY'
@@ -92,6 +138,18 @@ print(f"PAIRING PASS: rows=100000, calibration=30000, causal=70000, changed_targ
 PY
 }
 
+training_profile_args() {
+  PROFILE_ARGS=(
+    --batch-size "${TRAIN_BATCH_SIZE}"
+    --gradient-accumulation-steps "${TRAIN_GRAD_ACCUM_STEPS}"
+  )
+  if [[ "${TRAIN_GRADIENT_CHECKPOINTING}" == "1" ]]; then
+    PROFILE_ARGS+=(--gradient-checkpointing)
+  else
+    PROFILE_ARGS+=(--no-gradient-checkpointing)
+  fi
+}
+
 train_run() {
   local tag="$1"
   local config="$2"
@@ -99,7 +157,9 @@ train_run() {
   local log_path="$4"
   shift 4
 
+  training_profile_args
   echo "===== TRAIN ${tag} ====="
+  echo "profile: micro_batch=${TRAIN_BATCH_SIZE}, world_size=2, grad_accum=${TRAIN_GRAD_ACCUM_STEPS}, effective_update_batch=${EFFECTIVE_UPDATE_BATCH}, gradient_checkpointing=${TRAIN_GRADIENT_CHECKPOINTING}"
   CUDA_VISIBLE_DEVICES="${GPU_FIRST},${GPU_SECOND}" \
   "${PYTHON_BIN}" -m torch.distributed.run \
     --standalone \
@@ -107,6 +167,7 @@ train_run() {
     -m relacats_v2.model_training.train_hybrid_relsc_ssc \
     --config-file "${config}" \
     --save-path "${save_path}" \
+    "${PROFILE_ARGS[@]}" \
     "$@" \
     2>&1 | tee "${log_path}"
 }
@@ -137,6 +198,15 @@ merge_one() {
   touch "${marker}"
 }
 
+echo "===== HIGH-THROUGHPUT PAIRED QWEN PROFILE ====="
+echo "GPUs: ${GPU_FIRST},${GPU_SECOND}"
+echo "micro_batch_per_rank=${TRAIN_BATCH_SIZE}"
+echo "gradient_accumulation=${TRAIN_GRAD_ACCUM_STEPS}"
+echo "effective_update_batch=${EFFECTIVE_UPDATE_BATCH}"
+echo "expected_full_optimizer_updates_per_model=${EXPECTED_FULL_UPDATES}"
+echo "gradient_checkpointing=${TRAIN_GRADIENT_CHECKPOINTING}"
+echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+
 if [[ "${RUN_TESTS}" == "1" ]]; then
   echo "===== PREFLIGHT TESTS ====="
   "${PYTHON_BIN}" -m pytest -q \
@@ -145,21 +215,24 @@ if [[ "${RUN_TESTS}" == "1" ]]; then
   check_pairing
 fi
 
+# Do this after CPU-only preflight so an old background probe can finish while
+# tests run, but before launching any training/evaluation worker.
+check_gpu_idle "${GPU_FIRST}"
+check_gpu_idle "${GPU_SECOND}"
+
 if [[ "${RUN_SMOKE}" == "1" ]]; then
-  smoke_root="${ROOT_DIR}/relacats_v2/outputs/checkpoints/paired_qwen_smoke"
+  smoke_root="${ROOT_DIR}/relacats_v2/outputs/checkpoints/paired_qwen_smoke_b${TRAIN_BATCH_SIZE}_a${TRAIN_GRAD_ACCUM_STEPS}"
   mkdir -p "${smoke_root}"
   train_run \
     "SSC SMOKE" "${SSC_CONFIG}" "${smoke_root}/ssc" "${LOG_ROOT}/ssc_smoke.log" \
     --max-train-samples "${SMOKE_TRAIN_SAMPLES}" \
     --max-eval-samples "${SMOKE_EVAL_SAMPLES}" \
-    --max-optimizer-steps "${SMOKE_STEPS}" \
-    --no-gradient-checkpointing
+    --max-optimizer-steps "${SMOKE_STEPS}"
   train_run \
     "RelSC SMOKE" "${RELSC_CONFIG}" "${smoke_root}/relsc" "${LOG_ROOT}/relsc_smoke.log" \
     --max-train-samples "${SMOKE_TRAIN_SAMPLES}" \
     --max-eval-samples "${SMOKE_EVAL_SAMPLES}" \
-    --max-optimizer-steps "${SMOKE_STEPS}" \
-    --no-gradient-checkpointing
+    --max-optimizer-steps "${SMOKE_STEPS}"
 fi
 
 if [[ "${RUN_FULL}" == "1" ]]; then
@@ -223,6 +296,7 @@ fi
 
 echo
 echo "ALL PAIRED QWEN STAGES COMPLETE"
+echo "Training profile: micro_batch=${TRAIN_BATCH_SIZE}, grad_accum=${TRAIN_GRAD_ACCUM_STEPS}, effective_batch=${EFFECTIVE_UPDATE_BATCH}, gradient_checkpointing=${TRAIN_GRADIENT_CHECKPOINTING}"
 echo "SSC adapter:      ${SSC_ADAPTER}"
 echo "RelSC adapter:    ${RELSC_ADAPTER}"
 echo "SSC merged:       ${SSC_MERGED}"
