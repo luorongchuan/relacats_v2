@@ -1,16 +1,19 @@
-"""Train RelaCaTS v2 with the selective hybrid confidence target.
+"""Train RelaCaTS v2 with configurable confidence targets.
 
-This wrapper reuses the battle-tested LoRA/DDP/loss implementation from
+This wrapper reuses the LoRA/DDP/loss implementation from
 ``model_training.train_relacats`` and replaces only its training-data selection.
 
 Training pool semantics:
-- ``target_field`` (default ``hybrid_consistency``) supplies the calibration target;
-- the same field is used for the > eta causal-LM selection unless
-  ``causal_selection_field`` is explicitly configured otherwise;
-- calibration examples are balanced over 0.05-wide confidence bins, following
-  the CaTS training code;
+- ``target_field`` supplies the calibration regression target;
+- ``calibration_selection_field`` controls the 0.05-wide calibration bins;
+- ``causal_selection_field`` controls the > eta causal-LM admission rule;
+- if the two selection fields are omitted they default to ``target_field``;
 - requested global train/eval and calibration/causal budgets are allocated
   exactly across datasets with deterministic largest-remainder rounding.
+
+The separate selection fields are important for a strict paired ablation: two
+runs can use exactly the same sampled records and differ only in the calibration
+target (SSC versus RelSC).
 """
 
 from __future__ import annotations
@@ -29,14 +32,7 @@ def _exact_weighted_allocation(
     total: int,
     weights: Sequence[float],
 ) -> list[int]:
-    """Allocate an integer total exactly according to non-negative weights.
-
-    Independent ``round(total * weight / sum(weights))`` calls can lose or add
-    a few records globally (for example 100000 -> 99998).  Largest-remainder
-    allocation preserves the requested total exactly while remaining as close
-    as possible to the desired proportions.  Ties are resolved by dataset
-    order for deterministic reproduction.
-    """
+    """Allocate an integer total exactly according to non-negative weights."""
 
     if total < 0:
         raise ValueError("allocation total must be non-negative")
@@ -73,6 +69,9 @@ def prepare_hybrid_examples(
 ) -> list[dict[str, Any]]:
     dataset_root = base.resolve_path(config["dataset_root"])
     target_field = str(config.get("target_field", "hybrid_consistency"))
+    calibration_field = str(
+        config.get("calibration_selection_field", target_field)
+    )
     causal_field = str(config.get("causal_selection_field", target_field))
     causal_ratio = float(config["causal_lm_ratio"])
     threshold = float(config["threshold"])
@@ -94,9 +93,6 @@ def prepare_hybrid_examples(
     if sum(raw_weights) <= 0:
         raise ValueError("Dataset weights must sum to a positive value")
 
-    # Preserve both global budgets exactly.  This avoids independent per-dataset
-    # rounding changing 100000 into 99998 (or 1000 into 1001), and also keeps
-    # the configured causal/calibration mixture exact at the global level.
     causal_total = int(round(requested_total * causal_ratio))
     calibration_total = requested_total - causal_total
     calibration_allocations = _exact_weighted_allocation(
@@ -114,12 +110,15 @@ def prepare_hybrid_examples(
         for record in records:
             try:
                 target = float(record[target_field])
+                calibration_score = float(record[calibration_field])
                 causal_score = float(record[causal_field])
             except (KeyError, TypeError, ValueError):
                 continue
             if not (
                 math.isfinite(target)
                 and 0.0 <= target <= 1.0
+                and math.isfinite(calibration_score)
+                and 0.0 <= calibration_score <= 1.0
                 and math.isfinite(causal_score)
                 and 0.0 <= causal_score <= 1.0
             ):
@@ -128,18 +127,20 @@ def prepare_hybrid_examples(
                 continue
             copied = dict(record)
             copied["_target"] = target
+            copied["_calibration_score"] = calibration_score
             copied["_causal_score"] = causal_score
             valid.append(copied)
 
         if records and not valid:
             raise ValueError(
-                f"Dataset {name!r} has no rows with usable {target_field!r} and "
-                f"{causal_field!r}. Rebuild the hybrid dataset first."
+                f"Dataset {name!r} has no rows with usable target/selection fields: "
+                f"target={target_field!r}, calibration={calibration_field!r}, "
+                f"causal={causal_field!r}. Rebuild the dataset first."
             )
 
         bins: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for record in valid:
-            bins[min(int(record["_target"] / 0.05), 20)].append(record)
+            bins[min(int(record["_calibration_score"] / 0.05), 20)].append(record)
 
         per_bin = max(1, calibration_count // 21) if calibration_count else 0
         calibration: list[dict[str, Any]] = []
@@ -164,8 +165,11 @@ def prepare_hybrid_examples(
                     "transformed_prompt": record["transformed_prompt"],
                     "response": record["response"],
                     "target": record["_target"],
+                    "selection_score": record["_calibration_score"],
                     "target_mode": HYBRID_MODE,
                     "target_method": record.get("target_method"),
+                    "question_id": record.get("question_id"),
+                    "sample_id": record.get("sample_id"),
                 }
             )
 
@@ -181,6 +185,8 @@ def prepare_hybrid_examples(
                     "selection_score": record["_causal_score"],
                     "target_mode": HYBRID_MODE,
                     "target_method": record.get("target_method"),
+                    "question_id": record.get("question_id"),
+                    "sample_id": record.get("sample_id"),
                 }
             )
 
@@ -195,8 +201,6 @@ def _hybrid_resolver(
     target_mode: str, lambda_rel: float
 ) -> float:
     if str(target_mode).strip().lower() == HYBRID_MODE:
-        # main() calls the resolver once only to validate configuration before
-        # data loading. Actual hybrid targets are read directly from JSONL.
         value = float(relssc)
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError("hybrid validation target must be in [0,1]")
