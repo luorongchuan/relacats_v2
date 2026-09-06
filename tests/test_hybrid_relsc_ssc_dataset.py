@@ -3,6 +3,9 @@ from relacats_v2.data_creation.build_hybrid_relsc_ssc_dataset import (
     numeric_ssc_scores,
     pure_relsc_scores,
 )
+from relacats_v2.model_training.train_hybrid_relsc_ssc import (
+    _exact_weighted_allocation,
+)
 
 
 def _sample(answer, confidence, valid=True, relation_id="g0"):
@@ -57,3 +60,16 @@ def test_invalid_answers_do_not_enter_target_denominators():
     scores = numeric_ssc_scores(numeric)
     assert abs(scores["1"] - 0.2) < 1e-12
     assert abs(scores["2"] - 0.8) < 1e-12
+
+
+def test_exact_weighted_allocation_preserves_global_budget():
+    weights = [1, 1, 3, 1, 1, 1, 1, 3, 1]
+
+    train = _exact_weighted_allocation(100_000, weights)
+    assert sum(train) == 100_000
+    assert train[2] in {23_076, 23_077}
+    assert train[7] in {23_076, 23_077}
+    assert all(value in {7_692, 7_693} for i, value in enumerate(train) if i not in {2, 7})
+
+    evaluation = _exact_weighted_allocation(1_000, weights)
+    assert sum(evaluation) == 1_000
