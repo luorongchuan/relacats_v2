@@ -1,11 +1,22 @@
-"""Paired bootstrap and RelSC/RelSSC disagreement analysis for MCQ RelaCaTS.
+"""Paired bootstrap and RelSC/RelSSC disagreement analysis for RelaCaTS.
 
 CPU-only. Reads already-generated question JSON files and never modifies them.
+The same evaluator supports both numeric and multiple-choice relation datasets.
 
-Comparisons:
+Data roles
+----------
+``--baseline-root`` is the identity-only 32-response pool. It supplies 32I-SC
+and 32I-SSC.
+
+``--input-root`` is the relation-view pool. It supplies Mapped-SC, RelSC-valid,
+RelSSC, and the RelSC/RelSSC disagreement diagnostics.
+
+Paired comparisons
+------------------
 1) 32I-SC -> Mapped-SC-paper
 2) 32I-SSC -> RelSSC
-3) RelSC-valid -> RelSSC
+3) 32I-SSC -> RelSC-valid      [primary direct RelSC test]
+4) RelSC-valid -> RelSSC
 
 Gold labels are used only for post-hoc evaluation and diagnosis. They must not
 be used to define a final test-time adaptive rule.
@@ -38,11 +49,26 @@ from relacats_v2.evaluation.reproduce_table1 import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_INPUT_ROOT = REPO_ROOT / "relacats_v1/outputs/generated_data/qwen2_5_7b_instruct"
-DEFAULT_BASELINE_ROOT = (
-    REPO_ROOT / "relacats_v1/outputs/generated_data_identity_only/qwen2_5_7b_instruct"
+DEFAULT_INPUT_ROOT = (
+    REPO_ROOT / "relacats_v1/outputs/generated_data/qwen2_5_7b_instruct"
 )
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "relacats_v2/outputs/mcq_bootstrap_disagreement"
+DEFAULT_BASELINE_ROOT = (
+    REPO_ROOT
+    / "relacats_v1/outputs/generated_data_identity_only/qwen2_5_7b_instruct"
+)
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "relacats_v2/outputs/relsc_bootstrap_disagreement"
+DEFAULT_DATASETS = (
+    "gsm8k",
+    "svamp",
+    "arc_easy",
+    "commonsense_qa",
+    "logiqa",
+    "openbookqa",
+    "reclor",
+    "sciq",
+    "winogrande",
+)
+PRIMARY_COMPARISON = "32I-SSC -> RelSC-valid"
 
 
 @dataclass(frozen=True)
@@ -60,6 +86,15 @@ class BootstrapRow:
     ci_excludes_zero: bool
     bootstrap_replicates: int
     seed: int
+
+
+@dataclass(frozen=True)
+class DatasetCoverage:
+    dataset: str
+    baseline_questions: int
+    relational_questions: int
+    shared_questions: int
+    question_sets_match: bool
 
 
 @dataclass(frozen=True)
@@ -122,23 +157,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", default=str(DEFAULT_INPUT_ROOT))
     parser.add_argument("--baseline-root", default=str(DEFAULT_BASELINE_ROOT))
-    parser.add_argument(
-        "--datasets",
-        nargs="+",
-        default=(
-            "arc_easy",
-            "commonsense_qa",
-            "logiqa",
-            "openbookqa",
-            "reclor",
-            "sciq",
-            "winogrande",
-        ),
-    )
+    parser.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS)
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--n-bins", type=int, default=10)
     parser.add_argument("--bootstrap-replicates", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--require-matched-question-sets",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fail when identity-only and relation roots do not contain exactly "
+            "the same question IDs. Otherwise use their intersection and warn."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -153,7 +185,6 @@ def _metric_arrays(
     metric: str,
     n_bins: int,
 ) -> float:
-    """Metric adapter; ECE helpers expect ordinary sequences, not numpy truth tests."""
     if metric == "accuracy":
         return 100.0 * float(np.mean(labels))
     if metric == "brier":
@@ -247,7 +278,7 @@ def _relsc_distribution(payload: Mapping[str, Any]) -> tuple[dict[str, float], i
         denominator += 1
     if denominator <= 0:
         return {}, 0
-    return {a: value / denominator for a, value in support.items()}, denominator
+    return {answer: value / denominator for answer, value in support.items()}, denominator
 
 
 def _relssc_distribution(payload: Mapping[str, Any]) -> tuple[dict[str, float], int]:
@@ -266,9 +297,7 @@ def _relssc_distribution(payload: Mapping[str, Any]) -> tuple[dict[str, float], 
     return dict(result.scores), result.valid_sample_count
 
 
-def _tv_distance(
-    first: Mapping[str, float], second: Mapping[str, float]
-) -> float:
+def _tv_distance(first: Mapping[str, float], second: Mapping[str, float]) -> float:
     keys = set(first) | set(second)
     return 0.5 * sum(
         abs(first.get(key, 0.0) - second.get(key, 0.0)) for key in keys
@@ -290,10 +319,7 @@ def _disagreement_row(
     payload: Mapping[str, Any],
 ) -> DisagreementRow | None:
     relsc = _sc_observation(
-        dataset,
-        payload,
-        scope="all",
-        invalid_policy="valid-only",
+        dataset, payload, scope="all", invalid_policy="valid-only"
     )
     relssc = _relssc_observation(dataset, payload)
     if relsc is None or relssc is None:
@@ -330,11 +356,8 @@ def _disagreement_row(
     )
 
 
-def _summary(
-    dataset: str, rows: Sequence[DisagreementRow]
-) -> DisagreementSummary:
-    n = len(rows)
-    if n <= 0:
+def _summary(dataset: str, rows: Sequence[DisagreementRow]) -> DisagreementSummary:
+    if not rows:
         raise ValueError(f"{dataset}: no disagreement observations")
     relsc_acc = 100.0 * float(np.mean([row.relsc_correct for row in rows]))
     relssc_acc = 100.0 * float(np.mean([row.relssc_correct for row in rows]))
@@ -342,25 +365,19 @@ def _summary(
     brier_relssc = 100.0 * float(np.mean([row.brier_relssc for row in rows]))
     return DisagreementSummary(
         dataset=dataset,
-        n=n,
+        n=len(rows),
         winner_changed_rate=float(np.mean([row.winner_changed for row in rows])),
         relsc_accuracy=relsc_acc,
         relssc_accuracy=relssc_acc,
         accuracy_delta_relssc_minus_relsc=relssc_acc - relsc_acc,
-        relsc_only_correct=sum(
-            row.outcome == "relsc_only_correct" for row in rows
-        ),
-        relssc_only_correct=sum(
-            row.outcome == "relssc_only_correct" for row in rows
-        ),
+        relsc_only_correct=sum(row.outcome == "relsc_only_correct" for row in rows),
+        relssc_only_correct=sum(row.outcome == "relssc_only_correct" for row in rows),
         both_correct=sum(row.outcome == "both_correct" for row in rows),
         both_wrong=sum(row.outcome == "both_wrong" for row in rows),
         mean_tv_distance=float(np.mean([row.tv_distance for row in rows])),
         median_tv_distance=float(np.median([row.tv_distance for row in rows])),
         mean_abs_confidence_shift=float(
-            np.mean(
-                [abs(row.confidence_shift_relssc_minus_relsc) for row in rows]
-            )
+            np.mean([abs(row.confidence_shift_relssc_minus_relsc) for row in rows])
         ),
         mean_brier_relsc=brier_relsc,
         mean_brier_relssc=brier_relssc,
@@ -383,16 +400,10 @@ def _tv_bin(value: float) -> str:
 
 
 def _tv_bin_summaries(
-    dataset: str, rows: Sequence[DisagreementRow]
+    dataset: str,
+    rows: Sequence[DisagreementRow],
 ) -> list[TVBinSummary]:
-    order = [
-        "0",
-        "(0,0.02]",
-        "(0.02,0.05]",
-        "(0.05,0.10]",
-        "(0.10,0.20]",
-        ">0.20",
-    ]
+    order = ["0", "(0,0.02]", "(0.02,0.05]", "(0.05,0.10]", "(0.10,0.20]", ">0.20"]
     grouped: dict[str, list[DisagreementRow]] = {label: [] for label in order}
     for row in rows:
         grouped[_tv_bin(row.tv_distance)].append(row)
@@ -402,41 +413,28 @@ def _tv_bin_summaries(
         members = grouped[label]
         if not members:
             continue
-        n = len(members)
         relsc_acc = float(np.mean([row.relsc_correct for row in members]))
         relssc_acc = float(np.mean([row.relssc_correct for row in members]))
         result.append(
             TVBinSummary(
                 dataset=dataset,
                 tv_bin=label,
-                n=n,
-                mean_tv_distance=float(
-                    np.mean([row.tv_distance for row in members])
-                ),
-                winner_changed_rate=float(
-                    np.mean([row.winner_changed for row in members])
-                ),
+                n=len(members),
+                mean_tv_distance=float(np.mean([row.tv_distance for row in members])),
+                winner_changed_rate=float(np.mean([row.winner_changed for row in members])),
                 relsc_accuracy=100.0 * relsc_acc,
                 relssc_accuracy=100.0 * relssc_acc,
-                accuracy_delta_relssc_minus_relsc=100.0
-                * (relssc_acc - relsc_acc),
+                accuracy_delta_relssc_minus_relsc=100.0 * (relssc_acc - relsc_acc),
                 relsc_only_correct_rate=float(
-                    np.mean(
-                        [row.outcome == "relsc_only_correct" for row in members]
-                    )
+                    np.mean([row.outcome == "relsc_only_correct" for row in members])
                 ),
                 relssc_only_correct_rate=float(
-                    np.mean(
-                        [row.outcome == "relssc_only_correct" for row in members]
-                    )
+                    np.mean([row.outcome == "relssc_only_correct" for row in members])
                 ),
                 mean_brier_delta_relssc_minus_relsc=100.0
                 * float(
                     np.mean(
-                        [
-                            row.brier_delta_relssc_minus_relsc
-                            for row in members
-                        ]
+                        [row.brier_delta_relssc_minus_relsc for row in members]
                     )
                 ),
             )
@@ -449,9 +447,8 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
-    fieldnames = list(rows[0].keys())
     with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -464,17 +461,13 @@ def _obs_list(
     result: list[Observation] = []
     for payload in payloads:
         if method == "sc-paper":
-            obs = _sc_observation(
-                dataset, payload, scope="all", invalid_policy="paper"
-            )
+            obs = _sc_observation(dataset, payload, scope="all", invalid_policy="paper")
         elif method == "sc-valid":
             obs = _sc_observation(
                 dataset, payload, scope="all", invalid_policy="valid-only"
             )
         elif method == "ssc-paper":
-            obs = _ssc_observation(
-                dataset, payload, scope="all", invalid_policy="paper"
-            )
+            obs = _ssc_observation(dataset, payload, scope="all", invalid_policy="paper")
         elif method == "relssc":
             obs = _relssc_observation(dataset, payload)
         else:
@@ -497,13 +490,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     bootstrap_rows: list[BootstrapRow] = []
+    coverage_rows: list[DatasetCoverage] = []
     disagreement_rows: list[DisagreementRow] = []
     summary_rows: list[DisagreementSummary] = []
     tv_rows: list[TVBinSummary] = []
 
-    print("MCQ RelaCaTS bootstrap + RelSC/RelSSC disagreement analysis")
-    print("=============================================================")
-    print(f"Bootstrap replicates: {args.bootstrap_replicates}, seed={args.seed}\n")
+    print("RelaCaTS bootstrap + RelSC/RelSSC disagreement analysis")
+    print("========================================================")
+    print(f"Bootstrap replicates: {args.bootstrap_replicates}, seed={args.seed}")
+    print(f"Baseline (32I): {baseline_root}")
+    print(f"Relation pool:  {input_root}\n")
 
     for dataset in args.datasets:
         baseline_index = _index_payloads(_load_payloads(baseline_root, dataset))
@@ -511,6 +507,25 @@ def main() -> None:
         shared_ids = sorted(set(baseline_index) & set(relational_index))
         if not shared_ids:
             raise ValueError(f"{dataset}: no shared question IDs")
+
+        sets_match = set(baseline_index) == set(relational_index)
+        coverage = DatasetCoverage(
+            dataset=dataset,
+            baseline_questions=len(baseline_index),
+            relational_questions=len(relational_index),
+            shared_questions=len(shared_ids),
+            question_sets_match=sets_match,
+        )
+        coverage_rows.append(coverage)
+        if not sets_match:
+            message = (
+                f"{dataset}: question sets differ "
+                f"(baseline={len(baseline_index)}, relation={len(relational_index)}, "
+                f"shared={len(shared_ids)})"
+            )
+            if args.require_matched_question_sets:
+                raise ValueError(message)
+            print(f"WARNING: {message}; using shared question IDs only.")
 
         baseline_payloads = [baseline_index[qid] for qid in shared_ids]
         relational_payloads = [relational_index[qid] for qid in shared_ids]
@@ -524,6 +539,7 @@ def main() -> None:
         comparisons = [
             ("32I-SC -> Mapped-SC-paper", base_sc, mapped_sc_paper),
             ("32I-SSC -> RelSSC", base_ssc, relssc),
+            (PRIMARY_COMPARISON, base_ssc, relsc_valid),
             ("RelSC-valid -> RelSSC", relsc_valid, relssc),
         ]
         for comparison, reference, target in comparisons:
@@ -551,19 +567,23 @@ def main() -> None:
         summary_rows.append(summary)
         tv_rows.extend(_tv_bin_summaries(dataset, current_disagreement))
 
-        relation_bootstrap = [
+        primary_rows = [
             row
             for row in bootstrap_rows
             if row.dataset == dataset
-            and row.comparison == "32I-SC -> Mapped-SC-paper"
-            and row.metric in {"ece_paper", "brier", "accuracy"}
+            and row.comparison == PRIMARY_COMPARISON
+            and row.metric in {"accuracy", "ece_paper", "brier"}
         ]
-        print(f"[{dataset}] n={len(shared_ids)}")
-        for row in relation_bootstrap:
+        print(
+            f"[{dataset}] baseline={len(baseline_index)} relation={len(relational_index)} "
+            f"shared={len(shared_ids)}"
+        )
+        print(f"  Primary: {PRIMARY_COMPARISON}")
+        for row in primary_rows:
             direction = "better" if row.probability_improvement >= 0.5 else "worse"
             print(
                 f"  {row.metric:<10s} {row.reference_value:7.3f} -> "
-                f"{row.target_value:7.3f}  delta={row.point_delta_target_minus_reference:+7.3f} "
+                f"{row.target_value:7.3f} delta={row.point_delta_target_minus_reference:+7.3f} "
                 f"CI=[{row.ci_low_95:+7.3f},{row.ci_high_95:+7.3f}] "
                 f"P(improve)={row.probability_improvement:.3f} ({direction})"
             )
@@ -576,12 +596,14 @@ def main() -> None:
         )
 
     bootstrap_path = output_dir / "bootstrap_paired_deltas.csv"
+    coverage_path = output_dir / "dataset_coverage.csv"
     disagreement_path = output_dir / "relsc_relssc_disagreement_questions.csv"
     summary_path = output_dir / "relsc_relssc_disagreement_summary.csv"
     tv_path = output_dir / "relsc_relssc_tv_bins.csv"
     report_path = output_dir / "analysis_report.json"
 
     _write_csv(bootstrap_path, [asdict(row) for row in bootstrap_rows])
+    _write_csv(coverage_path, [asdict(row) for row in coverage_rows])
     _write_csv(disagreement_path, [asdict(row) for row in disagreement_rows])
     _write_csv(summary_path, [asdict(row) for row in summary_rows])
     _write_csv(tv_path, [asdict(row) for row in tv_rows])
@@ -590,17 +612,21 @@ def main() -> None:
         "input_root": str(input_root),
         "baseline_root": str(baseline_root),
         "datasets": list(args.datasets),
+        "primary_comparison": PRIMARY_COMPARISON,
         "n_bins": args.n_bins,
         "bootstrap_replicates": args.bootstrap_replicates,
         "seed": args.seed,
+        "coverage": [asdict(row) for row in coverage_rows],
         "bootstrap": [asdict(row) for row in bootstrap_rows],
         "disagreement_summary": [asdict(row) for row in summary_rows],
         "tv_bins": [asdict(row) for row in tv_rows],
         "notes": [
+            "Baseline root provides identity-only 32-response SC/SSC.",
+            "Input root provides relation-view RelSC/RelSSC.",
             "All bootstrap comparisons are paired by question_id.",
+            "32I-SSC -> RelSC-valid is the primary direct RelSC comparison.",
             "ECE/Brier lower is better; accuracy higher is better.",
             "Gold-based outcome labels are post-hoc diagnostics only.",
-            "TV distance and the two answer distributions are label-free quantities.",
         ],
     }
     report_path.write_text(
@@ -611,6 +637,7 @@ def main() -> None:
     print("Outputs:")
     for path in (
         bootstrap_path,
+        coverage_path,
         disagreement_path,
         summary_path,
         tv_path,
