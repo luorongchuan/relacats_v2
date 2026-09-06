@@ -5,13 +5,17 @@ set -Eeuo pipefail
 #   preflight -> optional short smoke -> full SSC/RelSC training -> LoRA merge
 #   -> Table-2 style evaluation on GPUs 6+7 -> paired comparison report.
 #
-# High-throughput A100-80GB profile (validated on GPUs 6/7):
-#   per-rank micro-batch = 14
+# OOM-safe high-throughput A100-80GB profile for GPUs 6/7:
+#   per-rank micro-batch = 13
 #   world size           = 2
 #   grad accumulation    = 5
-#   effective update     = 140 records
+#   effective update     = 130 records
 #   gradient checkpointing disabled
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+#
+# B=14 reached roughly 75 GiB before the fp32 causal-LM loss conversion and
+# OOMed on a longer full-training batch.  B=13 leaves one additional record's
+# activation/logit headroom while still keeping the two A100s highly utilized.
 #
 # The two full training runs use exactly the same paired dataset, sampling
 # fields, seed, 100k/1k budgets, high-throughput batch profile and all other
@@ -19,7 +23,7 @@ set -Eeuo pipefail
 #   SSC   : ssc_consistency
 #   RelSC : relsc_consistency
 #
-# NOTE: effective batch 140 is the high-throughput paired protocol, not the
+# NOTE: effective batch 130 is the high-throughput paired protocol, not the
 # original batch-128 CaTS reproduction.  It is valid for the controlled
 # SSC-vs-RelSC target comparison because both runs use the identical profile.
 
@@ -44,9 +48,6 @@ EVAL_ROOT="${EVAL_ROOT:-${ROOT_DIR}/relacats_v2/outputs/paired_qwen_eval}"
 COMPARE_ROOT="${COMPARE_ROOT:-${ROOT_DIR}/relacats_v2/outputs/paired_qwen_comparison}"
 
 RUN_TESTS="${RUN_TESTS:-1}"
-# The separate B=14 VRAM probe already serves as the normal smoke test, so the
-# one-click high-throughput pipeline skips smoke by default.  Set RUN_SMOKE=1
-# to rerun a five-step smoke with the exact same batch profile as full training.
 RUN_SMOKE="${RUN_SMOKE:-0}"
 RUN_FULL="${RUN_FULL:-1}"
 RUN_MERGE="${RUN_MERGE:-1}"
@@ -54,7 +55,7 @@ RUN_EVAL="${RUN_EVAL:-1}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
 
 # High-throughput training knobs.  Keep these identical for SSC and RelSC.
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-14}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-13}"
 TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-5}"
 TRAIN_GRADIENT_CHECKPOINTING="${TRAIN_GRADIENT_CHECKPOINTING:-0}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -103,7 +104,7 @@ check_gpu_idle() {
   local pids
   pids="$(nvidia-smi -i "${gpu}" --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d')" \
     || fail "Unable to query GPU ${gpu}"
-  [[ -z "${pids}" ]] || fail "GPU ${gpu} is busy (PID(s): ${pids}); finish/stop the VRAM probe before starting the one-click run"
+  [[ -z "${pids}" ]] || fail "GPU ${gpu} is busy (PID(s): ${pids}); finish/stop any previous run before starting the one-click run"
 }
 
 check_pairing() {
@@ -215,8 +216,6 @@ if [[ "${RUN_TESTS}" == "1" ]]; then
   check_pairing
 fi
 
-# Do this after CPU-only preflight so an old background probe can finish while
-# tests run, but before launching any training/evaluation worker.
 check_gpu_idle "${GPU_FIRST}"
 check_gpu_idle "${GPU_SECOND}"
 
