@@ -5,27 +5,23 @@ set -Eeuo pipefail
 #   preflight -> optional short smoke -> full SSC/RelSC training -> LoRA merge
 #   -> Table-2 style evaluation on GPUs 6+7 -> paired comparison report.
 #
-# OOM-safe high-throughput A100-80GB profile for GPUs 6/7:
-#   per-rank micro-batch = 13
+# Standard A100-80GB paired training profile for GPUs 6/7:
+#   per-rank micro-batch = 8
 #   world size           = 2
-#   grad accumulation    = 5
-#   effective update     = 130 records
+#   grad accumulation    = 8
+#   effective update     = 128 records
 #   gradient checkpointing disabled
 #   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #
-# B=14 reached roughly 75 GiB before the fp32 causal-LM loss conversion and
-# OOMed on a longer full-training batch.  B=13 leaves one additional record's
-# activation/logit headroom while still keeping the two A100s highly utilized.
+# B=16 and B=14 were too close to the 80GB memory ceiling on long causal-LM
+# batches.  B=8 is a conventional power-of-two micro-batch and restores the
+# effective batch size of 128 while leaving substantially more VRAM headroom.
 #
 # The two full training runs use exactly the same paired dataset, sampling
-# fields, seed, 100k/1k budgets, high-throughput batch profile and all other
-# hyperparameters.  Only target_field differs:
+# fields, seed, 100k/1k budgets, batch profile and all other hyperparameters.
+# Only target_field differs:
 #   SSC   : ssc_consistency
 #   RelSC : relsc_consistency
-#
-# NOTE: effective batch 130 is the high-throughput paired protocol, not the
-# original batch-128 CaTS reproduction.  It is valid for the controlled
-# SSC-vs-RelSC target comparison because both runs use the identical profile.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
@@ -54,9 +50,9 @@ RUN_MERGE="${RUN_MERGE:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
 
-# High-throughput training knobs.  Keep these identical for SSC and RelSC.
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-13}"
-TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-5}"
+# Standard paired training knobs. Keep these identical for SSC and RelSC.
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+TRAIN_GRAD_ACCUM_STEPS="${TRAIN_GRAD_ACCUM_STEPS:-8}"
 TRAIN_GRADIENT_CHECKPOINTING="${TRAIN_GRADIENT_CHECKPOINTING:-0}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF
@@ -199,7 +195,7 @@ merge_one() {
   touch "${marker}"
 }
 
-echo "===== HIGH-THROUGHPUT PAIRED QWEN PROFILE ====="
+echo "===== STANDARD PAIRED QWEN PROFILE ====="
 echo "GPUs: ${GPU_FIRST},${GPU_SECOND}"
 echo "micro_batch_per_rank=${TRAIN_BATCH_SIZE}"
 echo "gradient_accumulation=${TRAIN_GRAD_ACCUM_STEPS}"
